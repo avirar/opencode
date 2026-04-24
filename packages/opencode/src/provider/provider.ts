@@ -37,6 +37,29 @@ function shouldUseCopilotResponsesApi(modelID: string): boolean {
   return Number(match[1]) >= 5 && !modelID.startsWith("gpt-5-mini")
 }
 
+async function discoverLlamaProps(baseURL: string): Promise<number | undefined> {
+  let propsUrl: string
+  try {
+    const parsed = new URL(baseURL)
+    // use the origin (protocol + host + port), strip any path
+    propsUrl = parsed.origin + "/props"
+  } catch {
+    // invalid URL — fall back to regex approach
+    propsUrl = baseURL.replace(/\/v1(\/)?$/i, "") + "/props"
+  }
+  try {
+    const signal = AbortSignal.timeout(2_000)
+    const res = await fetch(propsUrl, { signal })
+    if (!res.ok) return undefined
+    const data = await res.json()
+    const nCtx = data?.default_generation_settings?.n_ctx
+    if (typeof nCtx === "number" && nCtx > 0) return nCtx
+  } catch {
+    // timeout, network error, parse error — treat as unavailable
+  }
+  return undefined
+}
+
 function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (typeof ms !== "number" || ms <= 0) return res
   if (!res.body) return res
@@ -1207,6 +1230,34 @@ const layer: Layer.Layer<
           }
           database[providerID] = parsed
         }
+
+        // auto-discover llama.cpp context sizes from /props
+        const propsBaseURLs = new Map<string, ProviderID>()
+        for (const [providerID, provider] of Object.entries(database)) {
+          if (provider.source !== "config") continue
+          if (!provider.models) continue
+          const baseUrl = provider.options?.baseURL
+          if (!baseUrl || typeof baseUrl !== "string") continue
+
+          const hasUnsetContext = Object.values(provider.models).some(
+            (m) => m.limit.context === 0 && m.api.npm.includes("@ai-sdk/openai-compatible"),
+          )
+          if (!hasUnsetContext) continue
+
+          propsBaseURLs.set(baseUrl, ProviderID.make(providerID))
+        }
+
+        yield* Effect.promise(async () => {
+          for (const [baseUrl, providerID] of propsBaseURLs) {
+            const nCtx = await discoverLlamaProps(baseUrl)
+            if (!nCtx) continue
+            log.info("discovered context size from /props", { providerID, nCtx })
+            database[providerID].models &&
+              Object.values(database[providerID].models).forEach((m) => {
+                if (m.limit.context === 0) m.limit.context = nCtx
+              })
+          }
+        })
 
         // load env
         const envs = yield* env.all()
